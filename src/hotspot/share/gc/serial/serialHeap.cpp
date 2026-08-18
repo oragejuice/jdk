@@ -81,119 +81,56 @@
 #include "utilities/stack.inline.hpp"
 #include "utilities/vmError.hpp"
 
-SerialHeap* SerialHeap::heap() {
-  return named_heap<SerialHeap>(CollectedHeap::Serial);
-}
 
-SerialHeap::SerialHeap() :
-    CollectedHeap(),
-    _young_gen(nullptr),
-    _old_gen(nullptr),
-    _young_gen_saved_top(nullptr),
-    _old_gen_saved_top(nullptr),
-    _rem_set(nullptr),
-    _gc_policy_counters(new GCPolicyCounters("Copy:MSC", 2, 2)),
-    _young_manager(nullptr),
-    _old_manager(nullptr),
-    _eden_pool(nullptr),
-    _survivor_pool(nullptr),
-    _old_pool(nullptr),
-    _is_heap_almost_full(false) {
-  _young_manager = new GCMemoryManager("Copy");
-  _old_manager = new GCMemoryManager("MarkSweepCompact");
-  GCLocker::initialize();
-}
+bool SerialHeap::do_young_collection(bool clear_soft_refs) {
+  if (!is_young_gc_safe()) {
+    return false;
+  }
+  IsSTWGCActiveMark gc_active_mark;
+  SvcGCMarker sgcm(SvcGCMarker::MINOR);
+  GCIdMark gc_id_mark;
+  GCTraceCPUTime tcpu(_young_gen->gc_tracer());
+  GCTraceTime(Info, gc) t("Pause Young", nullptr, gc_cause(), true);
+  TraceCollectorStats tcs(_young_gen->counters());
+  TraceMemoryManagerStats tmms(_young_gen->gc_manager(), gc_cause(), "end of minor GC");
+  print_before_gc();
+  const PreGenGCValues pre_gc_values = get_pre_gc_values();
 
-void SerialHeap::initialize_serviceability() {
-  DefNewGeneration* young = young_gen();
+  increment_total_collections(false);
+  const bool should_verify = total_collections() >= VerifyGCStartAt;
+  if (should_verify && VerifyBeforeGC) {
+    prepare_for_verify();
+    Universe::verify("Before GC");
+  }
+  gc_prologue();
+  COMPILER2_PRESENT(DerivedPointerTable::clear());
 
-  // Add a memory pool for each space and young gen doesn't
-  // support low memory detection as it is expected to get filled up.
-  _eden_pool = new ContiguousSpacePool(young->eden(),
-                                       "Eden Space",
-                                       young->max_eden_size(),
-                                       false /* support_usage_threshold */);
-  _survivor_pool = new SurvivorContiguousSpacePool(young,
-                                                   "Survivor Space",
-                                                   young->max_survivor_size(),
-                                                   false /* support_usage_threshold */);
-  TenuredGeneration* old = old_gen();
-  _old_pool = new TenuredGenerationPool(old, "Tenured Gen", true);
+  save_marks();
 
-  _young_manager->add_pool(_eden_pool);
-  _young_manager->add_pool(_survivor_pool);
-  young->set_gc_manager(_young_manager);
+  bool result = _young_gen->collect(clear_soft_refs);
 
-  _old_manager->add_pool(_eden_pool);
-  _old_manager->add_pool(_survivor_pool);
-  _old_manager->add_pool(_old_pool);
-  old->set_gc_manager(_old_manager);
-}
+  COMPILER2_PRESENT(DerivedPointerTable::update_pointers());
 
-GrowableArray<GCMemoryManager*> SerialHeap::memory_managers() {
-  GrowableArray<GCMemoryManager*> memory_managers(2);
-  memory_managers.append(_young_manager);
-  memory_managers.append(_old_manager);
-  return memory_managers;
-}
-
-GrowableArray<MemoryPool*> SerialHeap::memory_pools() {
-  GrowableArray<MemoryPool*> memory_pools(3);
-  memory_pools.append(_eden_pool);
-  memory_pools.append(_survivor_pool);
-  memory_pools.append(_old_pool);
-  return memory_pools;
-}
-
-HeapWord* SerialHeap::allocate_loaded_archive_space(size_t word_size) {
-  MutexLocker ml(Heap_lock);
-  HeapWord* const addr = old_gen()->allocate(word_size);
-  return addr != nullptr ? addr : old_gen()->expand_and_allocate(word_size);
-}
-
-void SerialHeap::complete_loaded_archive_space(MemRegion archive_space) {
-  assert(old_gen()->used_region().contains(archive_space), "Archive space not contained in old gen");
-  old_gen()->complete_loaded_archive_space(archive_space);
-}
-
-void SerialHeap::pin_object(JavaThread* thread, oop obj) {
-  GCLocker::enter(thread);
-}
-
-void SerialHeap::unpin_object(JavaThread* thread, oop obj) {
-  GCLocker::exit(thread);
-}
-
-jint SerialHeap::initialize() {
-  // Allocate space for the heap.
-
-  ReservedHeapSpace heap_rs = allocate(HeapAlignment);
-
-  if (!heap_rs.is_reserved()) {
-    vm_shutdown_during_initialization(
-      "Could not reserve enough space for object heap");
-    return JNI_ENOMEM;
+  // Only update stats for successful young-gc
+  if (result) {
+    _old_gen->update_promote_stats();
+    _young_gen->resize_after_young_gc();
   }
 
-  initialize_reserved_region(heap_rs);
+  if (should_verify && VerifyAfterGC) {
+    Universe::verify("After GC");
+  }
 
-  ReservedSpace young_rs = heap_rs.first_part(MaxNewSize, SpaceAlignment);
-  ReservedSpace old_rs = heap_rs.last_part(MaxNewSize, SpaceAlignment);
+  print_heap_change(pre_gc_values);
 
-  _rem_set = new CardTableRS(_reserved);
-  _rem_set->initialize(young_rs.base(), old_rs.base());
+  // Track memory usage and detect low memory after GC finishes
+  MemoryService::track_memory_usage();
 
-  CardTableBarrierSet *bs = new CardTableBarrierSet(_rem_set);
-  BarrierSet::set_barrier_set(bs);
+  gc_epilogue(false);
 
-  _young_gen = new DefNewGeneration(young_rs, NewSize, MinNewSize, MaxNewSize);
-  _old_gen = new TenuredGeneration(old_rs, OldSize, MinOldSize, MaxOldSize, rem_set());
+  print_after_gc();
 
-  GCInitLogger::print();
-
-  FullGCForwarding::initialize(_reserved);
-
-  return JNI_OK;
+  return result;
 }
 
 ReservedHeapSpace SerialHeap::allocate(size_t alignment) {
@@ -223,27 +160,6 @@ ReservedHeapSpace SerialHeap::allocate(size_t alignment) {
   return heap_rs;
 }
 
-class GenIsScavengable : public BoolObjectClosure {
-public:
-  bool do_object_b(oop obj) {
-    return SerialHeap::heap()->is_in_young(obj);
-  }
-};
-
-static GenIsScavengable _is_scavengable;
-
-void SerialHeap::post_initialize() {
-  CollectedHeap::post_initialize();
-
-  DefNewGeneration* def_new_gen = (DefNewGeneration*)_young_gen;
-
-  def_new_gen->ref_processor_init();
-
-  SerialFullGC::initialize();
-
-  ScavengableNMethods::initialize(&_is_scavengable);
-}
-
 PreGenGCValues SerialHeap::get_pre_gc_values() const {
   const DefNewGeneration* const def_new_gen = (DefNewGeneration*) young_gen();
 
@@ -257,17 +173,123 @@ PreGenGCValues SerialHeap::get_pre_gc_values() const {
                         old_gen()->capacity());
 }
 
-size_t SerialHeap::capacity() const {
-  return _young_gen->capacity() + _old_gen->capacity();
+void SerialHeap::do_full_collection(bool clear_all_soft_refs) {
+  IsSTWGCActiveMark gc_active_mark;
+  SvcGCMarker sgcm(SvcGCMarker::FULL);
+  GCIdMark gc_id_mark;
+  GCTraceCPUTime tcpu(SerialFullGC::gc_tracer());
+  GCTraceTime(Info, gc) t("Pause Full", nullptr, gc_cause(), true);
+  TraceCollectorStats tcs(_old_gen->counters());
+  TraceMemoryManagerStats tmms(_old_gen->gc_manager(), gc_cause(), "end of major GC");
+  const PreGenGCValues pre_gc_values = get_pre_gc_values();
+  print_before_gc();
+
+  increment_total_collections(true);
+  const bool should_verify = total_collections() >= VerifyGCStartAt;
+  if (should_verify && VerifyBeforeGC) {
+    prepare_for_verify();
+    Universe::verify("Before GC");
+  }
+
+  gc_prologue();
+  COMPILER2_PRESENT(DerivedPointerTable::clear());
+  CodeCache::on_gc_marking_cycle_start();
+
+  STWGCTimer* gc_timer = SerialFullGC::gc_timer();
+  gc_timer->register_gc_start();
+
+  SerialOldTracer* gc_tracer = SerialFullGC::gc_tracer();
+  gc_tracer->report_gc_start(gc_cause(), gc_timer->gc_start());
+
+  pre_full_gc_dump(gc_timer);
+
+  SerialFullGC::invoke_at_safepoint(clear_all_soft_refs);
+
+  post_full_gc_dump(gc_timer);
+
+  gc_timer->register_gc_end();
+
+  gc_tracer->report_gc_end(gc_timer->gc_end(), gc_timer->time_partitions());
+  CodeCache::arm_all_nmethods();
+  COMPILER2_PRESENT(DerivedPointerTable::update_pointers());
+
+  // Adjust generation sizes.
+  _old_gen->compute_new_size();
+  _young_gen->resize_after_full_gc();
+
+  _old_gen->update_promote_stats();
+
+  // Resize the metaspace capacity after full collections
+  MetaspaceGC::compute_new_size();
+
+  print_heap_change(pre_gc_values);
+
+  // Track memory usage and detect low memory after GC finishes
+  MemoryService::track_memory_usage();
+
+  // Need to tell the epilogue code we are done with Full GC, regardless what was
+  // the initial value for "complete" flag.
+  gc_epilogue(true);
+
+  print_after_gc();
+
+  if (should_verify && VerifyAfterGC) {
+    Universe::verify("After GC");
+  }
 }
 
-size_t SerialHeap::used() const {
-  return _young_gen->used() + _old_gen->used();
+bool SerialHeap::is_young_gc_safe() const {
+  if (!_young_gen->to()->is_empty()) {
+    return false;
+  }
+  return _old_gen->promotion_attempt_is_safe(_young_gen->used());
 }
 
-size_t SerialHeap::max_capacity() const {
-  return _young_gen->max_capacity() + _old_gen->max_capacity();
+void SerialHeap::gc_prologue() {
+  // Fill TLAB's and such
+  ensure_parsability(true);   // retire TLABs
+
+  _old_gen->gc_prologue();
+};
+
+void SerialHeap::gc_epilogue(bool full) {
+#ifdef COMPILER2
+  assert(DerivedPointerTable::is_empty(), "derived pointer present");
+#endif // COMPILER2
+
+  resize_all_tlabs();
+
+  _young_gen->gc_epilogue();
+  _old_gen->gc_epilogue();
+
+  if (_is_heap_almost_full) {
+    // Reset the emergency state if eden is empty after a young/full gc
+    if (_young_gen->eden()->is_empty()) {
+      _is_heap_almost_full = false;
+    }
+  } else {
+    if (full && !_young_gen->eden()->is_empty()) {
+      // Usually eden should be empty after a full GC, so heap is probably too
+      // full now; entering emergency state.
+      _is_heap_almost_full = true;
+    }
+  }
+
+  MetaspaceCounters::update_performance_counters();
+};
+
+void SerialHeap::print_tracing_info() const {
+ // Does nothing
 }
+
+#ifdef ASSERT
+void SerialHeap::verify_not_in_native_if_java_thread() {
+  if (Thread::current()->is_Java_thread()) {
+    JavaThread* thread = JavaThread::current();
+    assert(thread->thread_state() != _thread_in_native, "precondition");
+  }
+}
+#endif
 
 HeapWord* SerialHeap::expand_heap_and_allocate(size_t size, bool is_tlab) {
   assert(Heap_lock->is_locked(), "precondition");
@@ -359,89 +381,96 @@ HeapWord* SerialHeap::mem_allocate_work(size_t size, bool is_tlab) {
   return result;
 }
 
+void SerialHeap::initialize_serviceability() {
+  DefNewGeneration* young = young_gen();
+
+  // Add a memory pool for each space and young gen doesn't
+  // support low memory detection as it is expected to get filled up.
+  _eden_pool = new ContiguousSpacePool(young->eden(),
+                                       "Eden Space",
+                                       young->max_eden_size(),
+                                       false /* support_usage_threshold */);
+  _survivor_pool = new SurvivorContiguousSpacePool(young,
+                                                   "Survivor Space",
+                                                   young->max_survivor_size(),
+                                                   false /* support_usage_threshold */);
+  TenuredGeneration* old = old_gen();
+  _old_pool = new TenuredGenerationPool(old, "Tenured Gen", true);
+
+  _young_manager->add_pool(_eden_pool);
+  _young_manager->add_pool(_survivor_pool);
+  young->set_gc_manager(_young_manager);
+
+  _old_manager->add_pool(_eden_pool);
+  _old_manager->add_pool(_survivor_pool);
+  _old_manager->add_pool(_old_pool);
+  old->set_gc_manager(_old_manager);
+}
+
+void SerialHeap::save_marks() {
+  _young_gen_saved_top = _young_gen->to()->top();
+  _old_gen_saved_top = _old_gen->space()->top();
+}
+
+jint SerialHeap::initialize() {
+  // Allocate space for the heap.
+
+  ReservedHeapSpace heap_rs = allocate(HeapAlignment);
+
+  if (!heap_rs.is_reserved()) {
+    vm_shutdown_during_initialization(
+      "Could not reserve enough space for object heap");
+    return JNI_ENOMEM;
+  }
+
+  initialize_reserved_region(heap_rs);
+
+  ReservedSpace young_rs = heap_rs.first_part(MaxNewSize, SpaceAlignment);
+  ReservedSpace old_rs = heap_rs.last_part(MaxNewSize, SpaceAlignment);
+
+  _rem_set = new CardTableRS(_reserved);
+  _rem_set->initialize(young_rs.base(), old_rs.base());
+
+  CardTableBarrierSet *bs = new CardTableBarrierSet(_rem_set);
+  BarrierSet::set_barrier_set(bs);
+
+  _young_gen = new DefNewGeneration(young_rs, NewSize, MinNewSize, MaxNewSize);
+  _old_gen = new TenuredGeneration(old_rs, OldSize, MinOldSize, MaxOldSize, rem_set());
+
+  GCInitLogger::print();
+
+  FullGCForwarding::initialize(_reserved);
+
+  return JNI_OK;
+}
+
+void SerialHeap::post_initialize() {
+  CollectedHeap::post_initialize();
+
+  DefNewGeneration* def_new_gen = (DefNewGeneration*)_young_gen;
+
+  def_new_gen->ref_processor_init();
+
+  SerialFullGC::initialize();
+
+  ScavengableNMethods::initialize(&_is_scavengable);
+}
+
+size_t SerialHeap::capacity() const {
+  return _young_gen->capacity() + _old_gen->capacity();
+}
+
+size_t SerialHeap::used() const {
+  return _young_gen->used() + _old_gen->used();
+}
+
+size_t SerialHeap::max_capacity() const {
+  return _young_gen->max_capacity() + _old_gen->max_capacity();
+}
+
 HeapWord* SerialHeap::mem_allocate(size_t size) {
   return mem_allocate_work(size,
                            false /* is_tlab */);
-}
-
-bool SerialHeap::is_young_gc_safe() const {
-  if (!_young_gen->to()->is_empty()) {
-    return false;
-  }
-  return _old_gen->promotion_attempt_is_safe(_young_gen->used());
-}
-
-bool SerialHeap::do_young_collection(bool clear_soft_refs) {
-  if (!is_young_gc_safe()) {
-    return false;
-  }
-  IsSTWGCActiveMark gc_active_mark;
-  SvcGCMarker sgcm(SvcGCMarker::MINOR);
-  GCIdMark gc_id_mark;
-  GCTraceCPUTime tcpu(_young_gen->gc_tracer());
-  GCTraceTime(Info, gc) t("Pause Young", nullptr, gc_cause(), true);
-  TraceCollectorStats tcs(_young_gen->counters());
-  TraceMemoryManagerStats tmms(_young_gen->gc_manager(), gc_cause(), "end of minor GC");
-  print_before_gc();
-  const PreGenGCValues pre_gc_values = get_pre_gc_values();
-
-  increment_total_collections(false);
-  const bool should_verify = total_collections() >= VerifyGCStartAt;
-  if (should_verify && VerifyBeforeGC) {
-    prepare_for_verify();
-    Universe::verify("Before GC");
-  }
-  gc_prologue();
-  COMPILER2_PRESENT(DerivedPointerTable::clear());
-
-  save_marks();
-
-  bool result = _young_gen->collect(clear_soft_refs);
-
-  COMPILER2_PRESENT(DerivedPointerTable::update_pointers());
-
-  // Only update stats for successful young-gc
-  if (result) {
-    _old_gen->update_promote_stats();
-    _young_gen->resize_after_young_gc();
-  }
-
-  if (should_verify && VerifyAfterGC) {
-    Universe::verify("After GC");
-  }
-
-  print_heap_change(pre_gc_values);
-
-  // Track memory usage and detect low memory after GC finishes
-  MemoryService::track_memory_usage();
-
-  gc_epilogue(false);
-
-  print_after_gc();
-
-  return result;
-}
-
-void SerialHeap::register_nmethod(nmethod* nm) {
-  ScavengableNMethods::register_nmethod(nm);
-  BarrierSetNMethod* bs_nm = BarrierSet::barrier_set()->barrier_set_nmethod();
-  bs_nm->disarm(nm);
-}
-
-void SerialHeap::unregister_nmethod(nmethod* nm) {
-  ScavengableNMethods::unregister_nmethod(nm);
-}
-
-void SerialHeap::verify_nmethod(nmethod* nm) {
-  ScavengableNMethods::verify_nmethod(nm);
-}
-
-void SerialHeap::prune_scavengable_nmethods() {
-  ScavengableNMethods::prune_nmethods_not_into_young();
-}
-
-void SerialHeap::prune_unlinked_nmethods() {
-  ScavengableNMethods::prune_unlinked_nmethods();
 }
 
 HeapWord* SerialHeap::satisfy_failed_allocation(size_t size, bool is_tlab) {
@@ -483,36 +512,6 @@ HeapWord* SerialHeap::satisfy_failed_allocation(size_t size, bool is_tlab) {
   return nullptr;
 }
 
-template <typename OopClosureType>
-static void oop_iterate_from(OopClosureType* blk, ContiguousSpace* space, HeapWord** from) {
-  assert(*from != nullptr, "precondition");
-  HeapWord* t;
-  HeapWord* p = *from;
-
-  const intx interval = PrefetchScanIntervalInBytes;
-  do {
-    t = space->top();
-    while (p < t) {
-      Prefetch::write(p, interval);
-      p += cast_to_oop(p)->oop_iterate_size(blk);
-    }
-  } while (t < space->top());
-
-  *from = space->top();
-}
-
-void SerialHeap::scan_evacuated_objs(YoungGenScanClosure* young_cl,
-                                     OldGenScanClosure* old_cl) {
-  ContiguousSpace* to_space = young_gen()->to();
-  do {
-    oop_iterate_from(young_cl, to_space, &_young_gen_saved_top);
-    oop_iterate_from(old_cl, old_gen()->space(), &_old_gen_saved_top);
-    // Recheck to-space only, because postcondition of oop_iterate_from is no
-    // unscanned objs
-  } while (_young_gen_saved_top != to_space->top());
-  guarantee(young_gen()->promo_failure_scan_is_complete(), "Failed to finish scan");
-}
-
 void SerialHeap::collect_at_safepoint(bool full) {
   assert(!GCLocker::is_active(), "precondition");
   bool clear_soft_refs = GCCause::should_clear_all_soft_refs(_gc_cause);
@@ -552,69 +551,17 @@ void SerialHeap::collect(GCCause::Cause cause) {
   VMThread::execute(&op);
 }
 
-void SerialHeap::do_full_collection(bool clear_all_soft_refs) {
-  IsSTWGCActiveMark gc_active_mark;
-  SvcGCMarker sgcm(SvcGCMarker::FULL);
-  GCIdMark gc_id_mark;
-  GCTraceCPUTime tcpu(SerialFullGC::gc_tracer());
-  GCTraceTime(Info, gc) t("Pause Full", nullptr, gc_cause(), true);
-  TraceCollectorStats tcs(_old_gen->counters());
-  TraceMemoryManagerStats tmms(_old_gen->gc_manager(), gc_cause(), "end of major GC");
-  const PreGenGCValues pre_gc_values = get_pre_gc_values();
-  print_before_gc();
+// Returns "TRUE" iff "p" points into the committed areas of the heap.
+bool SerialHeap::is_in(const void* p) const {
+  // precondition
+  verify_not_in_native_if_java_thread();
 
-  increment_total_collections(true);
-  const bool should_verify = total_collections() >= VerifyGCStartAt;
-  if (should_verify && VerifyBeforeGC) {
-    prepare_for_verify();
-    Universe::verify("Before GC");
+  if (!is_in_reserved(p)) {
+    // If it's not even in reserved.
+    return false;
   }
 
-  gc_prologue();
-  COMPILER2_PRESENT(DerivedPointerTable::clear());
-  CodeCache::on_gc_marking_cycle_start();
-
-  STWGCTimer* gc_timer = SerialFullGC::gc_timer();
-  gc_timer->register_gc_start();
-
-  SerialOldTracer* gc_tracer = SerialFullGC::gc_tracer();
-  gc_tracer->report_gc_start(gc_cause(), gc_timer->gc_start());
-
-  pre_full_gc_dump(gc_timer);
-
-  SerialFullGC::invoke_at_safepoint(clear_all_soft_refs);
-
-  post_full_gc_dump(gc_timer);
-
-  gc_timer->register_gc_end();
-
-  gc_tracer->report_gc_end(gc_timer->gc_end(), gc_timer->time_partitions());
-  CodeCache::arm_all_nmethods();
-  COMPILER2_PRESENT(DerivedPointerTable::update_pointers());
-
-  // Adjust generation sizes.
-  _old_gen->compute_new_size();
-  _young_gen->resize_after_full_gc();
-
-  _old_gen->update_promote_stats();
-
-  // Resize the metaspace capacity after full collections
-  MetaspaceGC::compute_new_size();
-
-  print_heap_change(pre_gc_values);
-
-  // Track memory usage and detect low memory after GC finishes
-  MemoryService::track_memory_usage();
-
-  // Need to tell the epilogue code we are done with Full GC, regardless what was
-  // the initial value for "complete" flag.
-  gc_epilogue(true);
-
-  print_after_gc();
-
-  if (should_verify && VerifyAfterGC) {
-    Universe::verify("After GC");
-  }
+  return _young_gen->is_in(p) || _old_gen->is_in(p);
 }
 
 bool SerialHeap::is_in_young(const void* p) const {
@@ -628,17 +575,26 @@ bool SerialHeap::requires_barriers(stackChunkOop obj) const {
   return !is_in_young(obj);
 }
 
-// Returns "TRUE" iff "p" points into the committed areas of the heap.
-bool SerialHeap::is_in(const void* p) const {
-  // precondition
-  verify_not_in_native_if_java_thread();
+void SerialHeap::register_nmethod(nmethod* nm) {
+  ScavengableNMethods::register_nmethod(nm);
+  BarrierSetNMethod* bs_nm = BarrierSet::barrier_set()->barrier_set_nmethod();
+  bs_nm->disarm(nm);
+}
 
-  if (!is_in_reserved(p)) {
-    // If it's not even in reserved.
-    return false;
-  }
+void SerialHeap::unregister_nmethod(nmethod* nm) {
+  ScavengableNMethods::unregister_nmethod(nm);
+}
 
-  return _young_gen->is_in(p) || _old_gen->is_in(p);
+void SerialHeap::verify_nmethod(nmethod* nm) {
+  ScavengableNMethods::verify_nmethod(nm);
+}
+
+void SerialHeap::prune_scavengable_nmethods() {
+  ScavengableNMethods::prune_nmethods_not_into_young();
+}
+
+void SerialHeap::prune_unlinked_nmethods() {
+  ScavengableNMethods::prune_unlinked_nmethods();
 }
 
 void SerialHeap::object_iterate(ObjectClosure* cl) {
@@ -701,11 +657,6 @@ void SerialHeap::prepare_for_verify() {
   ensure_parsability(false);        // no need to retire TLABs
 }
 
-void SerialHeap::save_marks() {
-  _young_gen_saved_top = _young_gen->to()->top();
-  _old_gen_saved_top = _old_gen->space()->top();
-}
-
 void SerialHeap::verify(VerifyOption option /* ignored */) {
   log_debug(gc, verify)("%s", _old_gen->name());
   _old_gen->verify();
@@ -739,10 +690,6 @@ bool SerialHeap::print_location(outputStream* st, void* addr) const {
   return BlockLocationPrinter<SerialHeap>::print_location(st, addr);
 }
 
-void SerialHeap::print_tracing_info() const {
- // Does nothing
-}
-
 void SerialHeap::print_heap_change(const PreGenGCValues& pre_gc_values) const {
   const DefNewGeneration* const def_new_gen = (DefNewGeneration*) young_gen();
 
@@ -773,44 +720,122 @@ void SerialHeap::print_heap_change(const PreGenGCValues& pre_gc_values) const {
   MetaspaceUtils::print_metaspace_change(pre_gc_values.metaspace_sizes());
 }
 
-void SerialHeap::gc_prologue() {
-  // Fill TLAB's and such
-  ensure_parsability(true);   // retire TLABs
-
-  _old_gen->gc_prologue();
-};
-
-void SerialHeap::gc_epilogue(bool full) {
-#ifdef COMPILER2
-  assert(DerivedPointerTable::is_empty(), "derived pointer present");
-#endif // COMPILER2
-
-  resize_all_tlabs();
-
-  _young_gen->gc_epilogue();
-  _old_gen->gc_epilogue();
-
-  if (_is_heap_almost_full) {
-    // Reset the emergency state if eden is empty after a young/full gc
-    if (_young_gen->eden()->is_empty()) {
-      _is_heap_almost_full = false;
-    }
-  } else {
-    if (full && !_young_gen->eden()->is_empty()) {
-      // Usually eden should be empty after a full GC, so heap is probably too
-      // full now; entering emergency state.
-      _is_heap_almost_full = true;
-    }
-  }
-
-  MetaspaceCounters::update_performance_counters();
-};
-
-#ifdef ASSERT
-void SerialHeap::verify_not_in_native_if_java_thread() {
-  if (Thread::current()->is_Java_thread()) {
-    JavaThread* thread = JavaThread::current();
-    assert(thread->thread_state() != _thread_in_native, "precondition");
-  }
+SerialHeap* SerialHeap::heap() {
+  return named_heap<SerialHeap>(CollectedHeap::Serial);
 }
-#endif
+
+SerialHeap::SerialHeap() :
+    CollectedHeap(),
+    _young_gen(nullptr),
+    _old_gen(nullptr),
+    _young_gen_saved_top(nullptr),
+    _old_gen_saved_top(nullptr),
+    _rem_set(nullptr),
+    _gc_policy_counters(new GCPolicyCounters("Copy:MSC", 2, 2)),
+    _young_manager(nullptr),
+    _old_manager(nullptr),
+    _eden_pool(nullptr),
+    _survivor_pool(nullptr),
+    _old_pool(nullptr),
+    _is_heap_almost_full(false) {
+  _young_manager = new GCMemoryManager("Copy");
+  _old_manager = new GCMemoryManager("MarkSweepCompact");
+  GCLocker::initialize();
+}
+
+
+GrowableArray<GCMemoryManager*> SerialHeap::memory_managers() {
+  GrowableArray<GCMemoryManager*> memory_managers(2);
+  memory_managers.append(_young_manager);
+  memory_managers.append(_old_manager);
+  return memory_managers;
+}
+
+GrowableArray<MemoryPool*> SerialHeap::memory_pools() {
+  GrowableArray<MemoryPool*> memory_pools(3);
+  memory_pools.append(_eden_pool);
+  memory_pools.append(_survivor_pool);
+  memory_pools.append(_old_pool);
+  return memory_pools;
+}
+
+void SerialHeap::scan_evacuated_objs(YoungGenScanClosure* young_cl,
+                                     OldGenScanClosure* old_cl) {
+  ContiguousSpace* to_space = young_gen()->to();
+  do {
+    oop_iterate_from(young_cl, to_space, &_young_gen_saved_top);
+    oop_iterate_from(old_cl, old_gen()->space(), &_old_gen_saved_top);
+    // Recheck to-space only, because postcondition of oop_iterate_from is no
+    // unscanned objs
+  } while (_young_gen_saved_top != to_space->top());
+  guarantee(young_gen()->promo_failure_scan_is_complete(), "Failed to finish scan");
+}
+
+HeapWord* SerialHeap::allocate_loaded_archive_space(size_t word_size) {
+  MutexLocker ml(Heap_lock);
+  HeapWord* const addr = old_gen()->allocate(word_size);
+  return addr != nullptr ? addr : old_gen()->expand_and_allocate(word_size);
+}
+
+void SerialHeap::complete_loaded_archive_space(MemRegion archive_space) {
+  assert(old_gen()->used_region().contains(archive_space), "Archive space not contained in old gen");
+  old_gen()->complete_loaded_archive_space(archive_space);
+}
+
+void SerialHeap::pin_object(JavaThread* thread, oop obj) {
+  GCLocker::enter(thread);
+}
+
+void SerialHeap::unpin_object(JavaThread* thread, oop obj) {
+  GCLocker::exit(thread);
+}
+
+
+class GenIsScavengable : public BoolObjectClosure {
+public:
+  bool do_object_b(oop obj) {
+    return SerialHeap::heap()->is_in_young(obj);
+  }
+};
+
+static GenIsScavengable _is_scavengable;
+
+template <typename OopClosureType>
+static void oop_iterate_from(OopClosureType* blk, ContiguousSpace* space, HeapWord** from) {
+  assert(*from != nullptr, "precondition");
+  HeapWord* t;
+  HeapWord* p = *from;
+
+  const intx interval = PrefetchScanIntervalInBytes;
+  do {
+    t = space->top();
+    while (p < t) {
+      Prefetch::write(p, interval);
+      p += cast_to_oop(p)->oop_iterate_size(blk);
+    }
+  } while (t < space->top());
+
+  *from = space->top();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
