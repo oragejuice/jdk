@@ -109,8 +109,6 @@ public:
 
 static GenIsScavengable _is_scavengable;
 
-
-
 bool SerialHeap::do_young_collection(bool clear_soft_refs) {
   if (!is_young_gc_safe()) {
     return false;
@@ -772,7 +770,6 @@ SerialHeap::SerialHeap() :
   GCLocker::initialize();
 }
 
-
 GrowableArray<GCMemoryManager*> SerialHeap::memory_managers() {
   GrowableArray<GCMemoryManager*> memory_managers(2);
   memory_managers.append(_young_manager);
@@ -818,28 +815,3 @@ void SerialHeap::pin_object(JavaThread* thread, oop obj) {
 void SerialHeap::unpin_object(JavaThread* thread, oop obj) {
   GCLocker::exit(thread);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
