@@ -82,6 +82,35 @@
 #include "utilities/vmError.hpp"
 
 
+template <typename OopClosureType>
+static void oop_iterate_from(OopClosureType* blk, ContiguousSpace* space, HeapWord** from) {
+  assert(*from != nullptr, "precondition");
+  HeapWord* t;
+  HeapWord* p = *from;
+
+  const intx interval = PrefetchScanIntervalInBytes;
+  do {
+    t = space->top();
+    while (p < t) {
+      Prefetch::write(p, interval);
+      p += cast_to_oop(p)->oop_iterate_size(blk);
+    }
+  } while (t < space->top());
+
+  *from = space->top();
+}
+
+class GenIsScavengable : public BoolObjectClosure {
+public:
+  bool do_object_b(oop obj) {
+    return SerialHeap::heap()->is_in_young(obj);
+  }
+};
+
+static GenIsScavengable _is_scavengable;
+
+
+
 bool SerialHeap::do_young_collection(bool clear_soft_refs) {
   if (!is_young_gc_safe()) {
     return false;
@@ -791,32 +820,7 @@ void SerialHeap::unpin_object(JavaThread* thread, oop obj) {
 }
 
 
-class GenIsScavengable : public BoolObjectClosure {
-public:
-  bool do_object_b(oop obj) {
-    return SerialHeap::heap()->is_in_young(obj);
-  }
-};
 
-static GenIsScavengable _is_scavengable;
-
-template <typename OopClosureType>
-static void oop_iterate_from(OopClosureType* blk, ContiguousSpace* space, HeapWord** from) {
-  assert(*from != nullptr, "precondition");
-  HeapWord* t;
-  HeapWord* p = *from;
-
-  const intx interval = PrefetchScanIntervalInBytes;
-  do {
-    t = space->top();
-    while (p < t) {
-      Prefetch::write(p, interval);
-      p += cast_to_oop(p)->oop_iterate_size(blk);
-    }
-  } while (t < space->top());
-
-  *from = space->top();
-}
 
 
 
